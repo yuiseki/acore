@@ -12,7 +12,6 @@ pub enum AgentTool {
     Claude,
     Codex,
     OpenCode,
-    /// テスト用のモックツール
     Mock,
 }
 
@@ -70,7 +69,6 @@ impl SessionManager {
     where
         F: FnMut(String) + Send + 'static,
     {
-        // Mock ツールの処理
         if tool == AgentTool::Mock {
             on_chunk("Mock: ".into());
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -80,35 +78,48 @@ impl SessionManager {
 
         let mut session_ids = self.session_ids.lock().await;
         let cmd = tool.command_name();
-        let mut command = Command::new(cmd);
-        
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut current_id = session_ids.get(&tool).cloned();
 
-        let is_resume = session_ids.contains_key(&tool);
-
-        if let Some(id) = session_ids.get(&tool) {
-            match tool {
-                AgentTool::Gemini => {
-                    command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id).arg("-p").arg(prompt);
-                }
-                AgentTool::Claude => {
-                    command.arg("--dangerously-skip-permissions").arg("--resume").arg(id).arg("--print").arg(prompt);
-                }
-                _ => { command.arg(prompt); }
-            }
-        } else {
-            let context = AgentExecutor::fetch_context().await;
-            let bootstrap = format!("{}\n\n依頼: {}", context, prompt);
+        if current_id.is_none() {
+            let init_prompt = AgentExecutor::build_init_prompt().await;
+            let mut seed_cmd = Command::new(cmd);
+            seed_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             
             match tool {
                 AgentTool::Gemini => {
-                    command.arg("--approval-mode").arg("yolo").arg("--output-format").arg("json").arg("-p").arg(bootstrap);
+                    seed_cmd.arg("--approval-mode").arg("yolo").arg("--output-format").arg("json").arg("-p").arg(&init_prompt);
                 }
                 AgentTool::Claude => {
-                    command.arg("--dangerously-skip-permissions").arg("--output-format").arg("json").arg("--print").arg(bootstrap);
+                    seed_cmd.arg("--dangerously-skip-permissions").arg("--output-format").arg("json").arg("--print").arg(&init_prompt);
                 }
-                _ => { command.arg(bootstrap); }
+                _ => { seed_cmd.arg(&init_prompt); }
             }
+
+            let output = seed_cmd.output().await?;
+            if !output.status.success() {
+                return Err(format!("Seed turn failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+            }
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Some(id) = Self::extract_session_id(&out_str) {
+                session_ids.insert(tool.clone(), id.clone());
+                current_id = Some(id);
+            } else {
+                return Err("Failed to extract session_id from seed turn.".into());
+            }
+        }
+
+        let mut command = Command::new(cmd);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let id = current_id.unwrap();
+
+        match tool {
+            AgentTool::Gemini => {
+                command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id).arg("-p").arg(prompt);
+            }
+            AgentTool::Claude => {
+                command.arg("--dangerously-skip-permissions").arg("--resume").arg(id).arg("--print").arg(prompt);
+            }
+            _ => { command.arg(prompt); }
         }
 
         let mut child = command.spawn().map_err(|e| format!("Failed to spawn {}: {}", cmd, e))?;
@@ -116,38 +127,16 @@ impl SessionManager {
         let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
         let mut err_reader = BufReader::new(stderr).lines();
 
-        let mut full_output = String::new();
         let mut buffer = [0; 1024];
-
-        if is_resume {
-            loop {
-                let n = stdout.read(&mut buffer).await?;
-                if n == 0 { break; }
-                let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
-                on_chunk(chunk);
-            }
-        } else {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            while reader.read_line(&mut line).await? > 0 {
-                full_output.push_str(&line);
-                line.clear();
-            }
+        loop {
+            let n = stdout.read(&mut buffer).await?;
+            if n == 0 { break; }
+            let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
+            on_chunk(chunk);
         }
 
         let status = child.wait().await?;
-        if status.success() {
-            if !is_resume {
-                if let Some(id) = Self::extract_session_id(&full_output) {
-                    session_ids.insert(tool, id);
-                }
-                if let Some(clean_res) = Self::extract_response(&full_output) {
-                    on_chunk(clean_res);
-                } else {
-                    on_chunk(full_output);
-                }
-            }
-        } else {
+        if !status.success() {
             let mut err_msg = String::new();
             while let Ok(Some(line)) = err_reader.next_line().await {
                 err_msg.push_str(&line);
@@ -174,20 +163,52 @@ impl AgentExecutor {
             .unwrap_or(false)
     }
 
+    /// amem の記憶から Snapshot 文字列を取得します
     pub async fn fetch_context() -> String {
-        if !Self::has_amem().await { return "".to_string(); }
+        let mut context = String::new();
+        if !Self::has_amem().await { return context; }
+
         let output = match Command::new("amem").arg("today").arg("--json").output().await {
             Ok(o) => o,
-            Err(_) => return "".to_string(),
+            Err(_) => return context,
         };
-        if !output.status.success() { return "".to_string(); }
+        if !output.status.success() { return context; }
+        
         let today: serde_json::Value = match serde_json::from_slice(&output.stdout) {
             Ok(t) => t,
-            Err(_) => return "".to_string(),
+            Err(_) => return context,
         };
-        format!("### プロフィール\n{}\n### 最近の活動\n{}", 
-            today["owner_profile"].as_str().unwrap_or(""), 
-            today["activity"].as_str().unwrap_or(""))
+
+        if let Some(profile) = today["owner_profile"].as_str() {
+            context.push_str("## Owner Profile\n");
+            context.push_str(profile);
+            context.push('\n');
+        }
+        if let Some(soul) = today["agent_soul"].as_str() {
+            context.push_str("\n## Agent Soul\n");
+            context.push_str(soul);
+            context.push('\n');
+        }
+        if let Some(activity) = today["activity"].as_str() {
+            context.push_str("\n## Recent Activities\n");
+            context.push_str(activity);
+            context.push('\n');
+        }
+        if let Some(memories) = today["agent_memories"].as_str() {
+            context.push_str("\n## Important Memories (P0)\n");
+            context.push_str(memories);
+            context.push('\n');
+        }
+        context
+    }
+
+    /// amem の記憶から初期化用プロンプトを構築します
+    pub async fn build_init_prompt() -> String {
+        let context = Self::fetch_context().await;
+        if context.is_empty() {
+            return String::from("Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n(amem context is empty or unavailable)");
+        }
+        format!("Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n{}", context)
     }
 
     pub async fn execute_stream<F>(
