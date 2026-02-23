@@ -266,6 +266,96 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};
 
+    // ─── AgentTool tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_agent_tool_command_name_gemini() {
+        assert_eq!(AgentTool::Gemini.command_name(), "gemini");
+    }
+
+    #[test]
+    fn test_agent_tool_command_name_claude() {
+        assert_eq!(AgentTool::Claude.command_name(), "claude");
+    }
+
+    #[test]
+    fn test_agent_tool_command_name_codex() {
+        assert_eq!(AgentTool::Codex.command_name(), "codex");
+    }
+
+    #[test]
+    fn test_agent_tool_command_name_opencode() {
+        assert_eq!(AgentTool::OpenCode.command_name(), "opencode");
+    }
+
+    #[test]
+    fn test_agent_tool_command_name_mock() {
+        assert_eq!(AgentTool::Mock.command_name(), "mock-agent");
+    }
+
+    #[test]
+    fn test_agent_tool_equality() {
+        assert_eq!(AgentTool::Gemini, AgentTool::Gemini);
+        assert_eq!(AgentTool::Claude, AgentTool::Claude);
+        assert_eq!(AgentTool::Codex, AgentTool::Codex);
+        assert_eq!(AgentTool::OpenCode, AgentTool::OpenCode);
+        assert_eq!(AgentTool::Mock, AgentTool::Mock);
+        assert_ne!(AgentTool::Gemini, AgentTool::Claude);
+        assert_ne!(AgentTool::Codex, AgentTool::OpenCode);
+        assert_ne!(AgentTool::Mock, AgentTool::Gemini);
+    }
+
+    #[test]
+    fn test_agent_tool_clone() {
+        let tool = AgentTool::Gemini;
+        let cloned = tool.clone();
+        assert_eq!(tool, cloned);
+    }
+
+    #[test]
+    fn test_agent_tool_can_be_used_as_hashmap_key() {
+        let mut map = HashMap::new();
+        map.insert(AgentTool::Gemini, "session-abc");
+        map.insert(AgentTool::Claude, "session-xyz");
+        assert_eq!(map.get(&AgentTool::Gemini), Some(&"session-abc"));
+        assert_eq!(map.get(&AgentTool::Claude), Some(&"session-xyz"));
+        assert_eq!(map.get(&AgentTool::Codex), None);
+    }
+
+    #[test]
+    fn test_agent_tool_debug_format() {
+        assert_eq!(format!("{:?}", AgentTool::Gemini), "Gemini");
+        assert_eq!(format!("{:?}", AgentTool::Claude), "Claude");
+        assert_eq!(format!("{:?}", AgentTool::Codex), "Codex");
+        assert_eq!(format!("{:?}", AgentTool::OpenCode), "OpenCode");
+        assert_eq!(format!("{:?}", AgentTool::Mock), "Mock");
+    }
+
+    // ─── AgentTool JSON serialization tests ───────────────────────────────────
+
+    #[test]
+    fn test_agent_tool_serialize() {
+        let json = serde_json::to_string(&AgentTool::Gemini).unwrap();
+        assert_eq!(json, r#""Gemini""#);
+    }
+
+    #[test]
+    fn test_agent_tool_deserialize() {
+        let tool: AgentTool = serde_json::from_str(r#""Claude""#).unwrap();
+        assert_eq!(tool, AgentTool::Claude);
+    }
+
+    #[test]
+    fn test_agent_tool_roundtrip_all_variants() {
+        for tool in [AgentTool::Gemini, AgentTool::Claude, AgentTool::Codex, AgentTool::OpenCode, AgentTool::Mock] {
+            let json = serde_json::to_string(&tool).unwrap();
+            let roundtrip: AgentTool = serde_json::from_str(&json).unwrap();
+            assert_eq!(tool, roundtrip);
+        }
+    }
+
+    // ─── SessionManager::extract_session_id tests ─────────────────────────────
+
     #[test]
     fn test_extract_session_id() {
         let json_output = r#"{"session_id": "test-uuid-1234", "status": "ok"}"#;
@@ -273,10 +363,114 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_session_id_camel_case() {
+        let json_output = r#"{"sessionId": "camel-uuid-5678", "status": "ok"}"#;
+        assert_eq!(SessionManager::extract_session_id(json_output), Some("camel-uuid-5678".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_snake_case_takes_priority() {
+        // Both fields present: snake_case should win (checked first)
+        let json_output = r#"{"session_id": "snake-id", "sessionId": "camel-id"}"#;
+        assert_eq!(SessionManager::extract_session_id(json_output), Some("snake-id".to_string()));
+    }
+
+    #[test]
+    fn test_extract_session_id_missing_field() {
+        let json_output = r#"{"status": "ok", "response": "hello"}"#;
+        assert_eq!(SessionManager::extract_session_id(json_output), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_invalid_json() {
+        assert_eq!(SessionManager::extract_session_id("not valid json"), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_empty_string() {
+        assert_eq!(SessionManager::extract_session_id(""), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_empty_json_object() {
+        assert_eq!(SessionManager::extract_session_id("{}"), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_non_string_value() {
+        let json_output = r#"{"session_id": 12345}"#;
+        assert_eq!(SessionManager::extract_session_id(json_output), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_null_value() {
+        let json_output = r#"{"session_id": null}"#;
+        assert_eq!(SessionManager::extract_session_id(json_output), None);
+    }
+
+    // ─── SessionManager::extract_response tests ───────────────────────────────
+
+    #[test]
     fn test_extract_response() {
         let json_output = r#"{"session_id": "abc", "response": "Hello, world!"}"#;
         assert_eq!(SessionManager::extract_response(json_output), Some("Hello, world!".to_string()));
     }
+
+    #[test]
+    fn test_extract_response_missing_field() {
+        let json_output = r#"{"session_id": "abc"}"#;
+        assert_eq!(SessionManager::extract_response(json_output), None);
+    }
+
+    #[test]
+    fn test_extract_response_invalid_json() {
+        assert_eq!(SessionManager::extract_response("not json"), None);
+    }
+
+    #[test]
+    fn test_extract_response_empty_string() {
+        assert_eq!(SessionManager::extract_response(""), None);
+    }
+
+    #[test]
+    fn test_extract_response_empty_value() {
+        let json_output = r#"{"response": ""}"#;
+        assert_eq!(SessionManager::extract_response(json_output), Some("".to_string()));
+    }
+
+    #[test]
+    fn test_extract_response_multiline_value() {
+        let json_output = r#"{"response": "line1\nline2\nline3"}"#;
+        assert_eq!(SessionManager::extract_response(json_output), Some("line1\nline2\nline3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_response_non_string_value() {
+        let json_output = r#"{"response": 42}"#;
+        assert_eq!(SessionManager::extract_response(json_output), None);
+    }
+
+    // ─── SessionManager state tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_session_manager_new_has_empty_sessions() {
+        let mgr = SessionManager::new();
+        let sessions = mgr.session_ids.lock().await;
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_clone_shares_state() {
+        let mgr = SessionManager::new();
+        let cloned = mgr.clone();
+        // Insert into original
+        mgr.session_ids.lock().await.insert(AgentTool::Gemini, "shared-id".to_string());
+        // Clone should see the same value (Arc-shared)
+        let val = cloned.session_ids.lock().await.get(&AgentTool::Gemini).cloned();
+        assert_eq!(val, Some("shared-id".to_string()));
+    }
+
+    // ─── AgentExecutor::execute_stream tests ──────────────────────────────────
 
     #[tokio::test]
     async fn test_execute_stream_chunks() {
@@ -286,5 +480,74 @@ mod tests {
             received_clone.lock().unwrap().push_str(&chunk);
         }).await;
         assert_eq!(*received.lock().unwrap(), "Mock stream: pong");
+    }
+
+    #[tokio::test]
+    async fn test_execute_stream_mock_succeeds() {
+        let result = AgentExecutor::execute_stream(AgentTool::Mock, "any prompt", |_| {}).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_stream_mock_calls_callback_once() {
+        let count = Arc::new(StdMutex::new(0usize));
+        let count_clone = Arc::clone(&count);
+        let _ = AgentExecutor::execute_stream(AgentTool::Mock, "hello", move |_| {
+            *count_clone.lock().unwrap() += 1;
+        }).await;
+        assert_eq!(*count.lock().unwrap(), 1);
+    }
+
+    // ─── SessionManager::execute_with_resume (Mock) tests ────────────────────
+
+    #[tokio::test]
+    async fn test_execute_with_resume_mock_succeeds() {
+        let mgr = SessionManager::new();
+        let result = mgr.execute_with_resume(AgentTool::Mock, "hello", |_| {}).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_resume_mock_returns_prompt_in_message() {
+        let mgr = SessionManager::new();
+        let received = Arc::new(StdMutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
+        let _ = mgr.execute_with_resume(AgentTool::Mock, "my prompt", move |chunk| {
+            received_clone.lock().unwrap().push_str(&chunk);
+        }).await;
+        let result = received.lock().unwrap().clone();
+        assert!(result.contains("my prompt"), "Expected 'my prompt' in '{}'", result);
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_resume_mock_does_not_store_session() {
+        let mgr = SessionManager::new();
+        let _ = mgr.execute_with_resume(AgentTool::Mock, "test", |_| {}).await;
+        // Mock should not pollute the session store
+        let sessions = mgr.session_ids.lock().await;
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_resume_mock_multiple_calls_succeed() {
+        let mgr = SessionManager::new();
+        for i in 0..3 {
+            let result = mgr.execute_with_resume(AgentTool::Mock, &format!("prompt {}", i), |_| {}).await;
+            assert!(result.is_ok(), "Call {} should succeed", i);
+        }
+    }
+
+    // ─── AgentExecutor::build_init_prompt tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_build_init_prompt_contains_memory_ready_instruction() {
+        let prompt = AgentExecutor::build_init_prompt().await;
+        assert!(prompt.contains("MEMORY_READY"), "Prompt must contain MEMORY_READY");
+    }
+
+    #[tokio::test]
+    async fn test_build_init_prompt_is_non_empty() {
+        let prompt = AgentExecutor::build_init_prompt().await;
+        assert!(!prompt.is_empty());
     }
 }
