@@ -7,9 +7,9 @@ struct Args {
     /// 実行するプロンプト
     prompt: String,
 
-    /// 使用するツール (gemini, claude, codex, opencode)
+    /// 使用するプロバイダー (gemini, claude, codex, opencode)
     #[arg(short, long, default_value = "gemini")]
-    tool: String,
+    provider: String,
 
     /// 要約して amem に記録するかどうか
     #[arg(short, long)]
@@ -20,7 +20,7 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
-    let tool = match args.tool.as_str() {
+    let provider = match args.provider.as_str() {
         "gemini" => AgentProvider::Gemini,
         "claude" => AgentProvider::Claude,
         "codex" => AgentProvider::Codex,
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     // ストリーミング実行（標準出力に出力）
-    AgentExecutor::execute_stream(tool.clone(), &args.prompt, |line| {
+    AgentExecutor::execute_stream(provider.clone(), &args.prompt, |line| {
         println!("{}", line);
     }).await?;
 

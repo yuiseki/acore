@@ -62,14 +62,14 @@ impl SessionManager {
 
     pub async fn execute_with_resume<F>(
         &self,
-        tool: AgentProvider,
+        provider: AgentProvider,
         prompt: &str,
         mut on_chunk: F,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(String) + Send + 'static,
     {
-        if tool == AgentProvider::Mock {
+        if provider == AgentProvider::Mock {
             on_chunk("Mock: ".into());
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             on_chunk(format!("received your prompt '{}'.", prompt));
@@ -77,15 +77,15 @@ impl SessionManager {
         }
 
         let mut session_ids = self.session_ids.lock().await;
-        let cmd = tool.command_name();
-        let mut current_id = session_ids.get(&tool).cloned();
+        let cmd = provider.command_name();
+        let mut current_id = session_ids.get(&provider).cloned();
 
         if current_id.is_none() {
             let init_prompt = AgentExecutor::build_init_prompt().await;
             let mut seed_cmd = Command::new(cmd);
             seed_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
             
-            match tool {
+            match provider {
                 AgentProvider::Gemini => {
                     seed_cmd.arg("--approval-mode").arg("yolo").arg("--output-format").arg("json").arg("-p").arg(&init_prompt);
                 }
@@ -101,7 +101,7 @@ impl SessionManager {
             }
             let out_str = String::from_utf8_lossy(&output.stdout);
             if let Some(id) = Self::extract_session_id(&out_str) {
-                session_ids.insert(tool.clone(), id.clone());
+                session_ids.insert(provider.clone(), id.clone());
                 current_id = Some(id);
             } else {
                 return Err("Failed to extract session_id from seed turn.".into());
@@ -112,7 +112,7 @@ impl SessionManager {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let id = current_id.unwrap();
 
-        match tool {
+        match provider {
             AgentProvider::Gemini => {
                 command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id).arg("-p").arg(prompt);
             }
@@ -212,19 +212,19 @@ impl AgentExecutor {
     }
 
     pub async fn execute_stream<F>(
-        tool: AgentProvider,
+        provider: AgentProvider,
         prompt: &str,
         mut on_chunk: F,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         F: FnMut(String) + Send + 'static,
     {
-        if tool == AgentProvider::Mock {
+        if provider == AgentProvider::Mock {
             on_chunk("Mock stream: pong".into());
             return Ok(());
         }
 
-        let mut child = Command::new(tool.command_name())
+        let mut child = Command::new(provider.command_name())
             .arg(prompt)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -245,12 +245,12 @@ impl AgentExecutor {
     }
 
     pub async fn summarize_and_record(
-        tool: AgentProvider,
+        provider: AgentProvider,
         transcript: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if tool == AgentProvider::Mock { return Ok(()); }
+        if provider == AgentProvider::Mock { return Ok(()); }
         if transcript.is_empty() || !Self::has_amem().await { return Ok(()); }
-        let output = Command::new(tool.command_name())
+        let output = Command::new(provider.command_name())
             .arg(format!("対話内容をAgentの活動ログとして1行で要約せよ：\n{}", transcript))
             .output().await?;
         let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -269,32 +269,32 @@ mod tests {
     // ─── AgentProvider tests ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_agent_tool_command_name_gemini() {
+    fn test_agent_provider_command_name_gemini() {
         assert_eq!(AgentProvider::Gemini.command_name(), "gemini");
     }
 
     #[test]
-    fn test_agent_tool_command_name_claude() {
+    fn test_agent_provider_command_name_claude() {
         assert_eq!(AgentProvider::Claude.command_name(), "claude");
     }
 
     #[test]
-    fn test_agent_tool_command_name_codex() {
+    fn test_agent_provider_command_name_codex() {
         assert_eq!(AgentProvider::Codex.command_name(), "codex");
     }
 
     #[test]
-    fn test_agent_tool_command_name_opencode() {
+    fn test_agent_provider_command_name_opencode() {
         assert_eq!(AgentProvider::OpenCode.command_name(), "opencode");
     }
 
     #[test]
-    fn test_agent_tool_command_name_mock() {
+    fn test_agent_provider_command_name_mock() {
         assert_eq!(AgentProvider::Mock.command_name(), "mock-agent");
     }
 
     #[test]
-    fn test_agent_tool_equality() {
+    fn test_agent_provider_equality() {
         assert_eq!(AgentProvider::Gemini, AgentProvider::Gemini);
         assert_eq!(AgentProvider::Claude, AgentProvider::Claude);
         assert_eq!(AgentProvider::Codex, AgentProvider::Codex);
@@ -306,14 +306,14 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_tool_clone() {
-        let tool = AgentProvider::Gemini;
-        let cloned = tool.clone();
-        assert_eq!(tool, cloned);
+    fn test_agent_provider_clone() {
+        let provider = AgentProvider::Gemini;
+        let cloned = provider.clone();
+        assert_eq!(provider, cloned);
     }
 
     #[test]
-    fn test_agent_tool_can_be_used_as_hashmap_key() {
+    fn test_agent_provider_can_be_used_as_hashmap_key() {
         let mut map = HashMap::new();
         map.insert(AgentProvider::Gemini, "session-abc");
         map.insert(AgentProvider::Claude, "session-xyz");
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_tool_debug_format() {
+    fn test_agent_provider_debug_format() {
         assert_eq!(format!("{:?}", AgentProvider::Gemini), "Gemini");
         assert_eq!(format!("{:?}", AgentProvider::Claude), "Claude");
         assert_eq!(format!("{:?}", AgentProvider::Codex), "Codex");
@@ -334,23 +334,23 @@ mod tests {
     // ─── AgentProvider JSON serialization tests ───────────────────────────────────
 
     #[test]
-    fn test_agent_tool_serialize() {
+    fn test_agent_provider_serialize() {
         let json = serde_json::to_string(&AgentProvider::Gemini).unwrap();
         assert_eq!(json, r#""Gemini""#);
     }
 
     #[test]
-    fn test_agent_tool_deserialize() {
-        let tool: AgentProvider = serde_json::from_str(r#""Claude""#).unwrap();
-        assert_eq!(tool, AgentProvider::Claude);
+    fn test_agent_provider_deserialize() {
+        let provider: AgentProvider = serde_json::from_str(r#""Claude""#).unwrap();
+        assert_eq!(provider, AgentProvider::Claude);
     }
 
     #[test]
-    fn test_agent_tool_roundtrip_all_variants() {
-        for tool in [AgentProvider::Gemini, AgentProvider::Claude, AgentProvider::Codex, AgentProvider::OpenCode, AgentProvider::Mock] {
-            let json = serde_json::to_string(&tool).unwrap();
+    fn test_agent_provider_roundtrip_all_variants() {
+        for provider in [AgentProvider::Gemini, AgentProvider::Claude, AgentProvider::Codex, AgentProvider::OpenCode, AgentProvider::Mock] {
+            let json = serde_json::to_string(&provider).unwrap();
             let roundtrip: AgentProvider = serde_json::from_str(&json).unwrap();
-            assert_eq!(tool, roundtrip);
+            assert_eq!(provider, roundtrip);
         }
     }
 
