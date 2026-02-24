@@ -129,7 +129,10 @@ impl SessionManager {
         if current_id.is_none() {
             let init_prompt = AgentExecutor::build_init_prompt().await;
             let mut seed_cmd = Command::new(cmd);
-            seed_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            // stdin must be null so CLI tools (especially claude) do not try to
+            // call setRawMode on an inherited non-TTY stdin (which causes EIO when
+            // running as a background service / Discord adapter).
+            seed_cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
             
             match provider {
                 AgentProvider::Gemini => {
@@ -167,7 +170,7 @@ impl SessionManager {
         }
 
         let mut command = Command::new(cmd);
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         let id = current_id.unwrap();
 
         match provider {
@@ -348,6 +351,7 @@ impl AgentExecutor {
 
         let mut child = Command::new(provider.command_name())
             .arg(prompt)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
