@@ -12,6 +12,7 @@ pub enum AgentProvider {
     Claude,
     Codex,
     OpenCode,
+    Dummy,
     Mock,
 }
 
@@ -22,6 +23,7 @@ impl AgentProvider {
             AgentProvider::Claude => "claude",
             AgentProvider::Codex => "codex",
             AgentProvider::OpenCode => "opencode",
+            AgentProvider::Dummy => "dummy-bot",
             AgentProvider::Mock => "mock-agent",
         }
     }
@@ -108,6 +110,11 @@ impl SessionManager {
     where
         F: FnMut(String) + Send + 'static,
     {
+        if provider == AgentProvider::Dummy {
+            on_chunk(prompt.to_string());
+            return Ok(());
+        }
+
         if provider == AgentProvider::Mock {
             on_chunk("Mock: ".into());
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -297,6 +304,11 @@ impl AgentExecutor {
     where
         F: FnMut(String) + Send + 'static,
     {
+        if provider == AgentProvider::Dummy {
+            on_chunk(prompt.to_string());
+            return Ok(());
+        }
+
         if provider == AgentProvider::Mock {
             on_chunk("Mock stream: pong".into());
             return Ok(());
@@ -358,7 +370,7 @@ impl AgentExecutor {
         provider: AgentProvider,
         transcript: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if provider == AgentProvider::Mock { return Ok(()); }
+        if provider == AgentProvider::Mock || provider == AgentProvider::Dummy { return Ok(()); }
         if transcript.is_empty() || !Self::has_amem().await { return Ok(()); }
         let prompt = format!("対話内容をAgentの活動ログとして1行で要約せよ：\n{}", transcript);
         let output = if provider == AgentProvider::Codex {
@@ -423,14 +435,21 @@ mod tests {
     }
 
     #[test]
+    fn test_agent_provider_command_name_dummy() {
+        assert_eq!(AgentProvider::Dummy.command_name(), "dummy-bot");
+    }
+
+    #[test]
     fn test_agent_provider_equality() {
         assert_eq!(AgentProvider::Gemini, AgentProvider::Gemini);
         assert_eq!(AgentProvider::Claude, AgentProvider::Claude);
         assert_eq!(AgentProvider::Codex, AgentProvider::Codex);
         assert_eq!(AgentProvider::OpenCode, AgentProvider::OpenCode);
+        assert_eq!(AgentProvider::Dummy, AgentProvider::Dummy);
         assert_eq!(AgentProvider::Mock, AgentProvider::Mock);
         assert_ne!(AgentProvider::Gemini, AgentProvider::Claude);
         assert_ne!(AgentProvider::Codex, AgentProvider::OpenCode);
+        assert_ne!(AgentProvider::Dummy, AgentProvider::Mock);
         assert_ne!(AgentProvider::Mock, AgentProvider::Gemini);
     }
 
@@ -457,6 +476,7 @@ mod tests {
         assert_eq!(format!("{:?}", AgentProvider::Claude), "Claude");
         assert_eq!(format!("{:?}", AgentProvider::Codex), "Codex");
         assert_eq!(format!("{:?}", AgentProvider::OpenCode), "OpenCode");
+        assert_eq!(format!("{:?}", AgentProvider::Dummy), "Dummy");
         assert_eq!(format!("{:?}", AgentProvider::Mock), "Mock");
     }
 
@@ -476,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_agent_provider_roundtrip_all_variants() {
-        for provider in [AgentProvider::Gemini, AgentProvider::Claude, AgentProvider::Codex, AgentProvider::OpenCode, AgentProvider::Mock] {
+        for provider in [AgentProvider::Gemini, AgentProvider::Claude, AgentProvider::Codex, AgentProvider::OpenCode, AgentProvider::Dummy, AgentProvider::Mock] {
             let json = serde_json::to_string(&provider).unwrap();
             let roundtrip: AgentProvider = serde_json::from_str(&json).unwrap();
             assert_eq!(provider, roundtrip);
@@ -669,6 +689,16 @@ Loaded cached credentials.
         assert_eq!(*count.lock().unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn test_execute_stream_dummy_echoes_prompt_exactly() {
+        let received = Arc::new(StdMutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
+        let _ = AgentExecutor::execute_stream(AgentProvider::Dummy, "echo me", move |chunk| {
+            received_clone.lock().unwrap().push_str(&chunk);
+        }).await;
+        assert_eq!(*received.lock().unwrap(), "echo me");
+    }
+
     // ─── SessionManager::execute_with_resume (Mock) tests ────────────────────
 
     #[tokio::test]
@@ -706,6 +736,25 @@ Loaded cached credentials.
             let result = mgr.execute_with_resume(AgentProvider::Mock, &format!("prompt {}", i), |_| {}).await;
             assert!(result.is_ok(), "Call {} should succeed", i);
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_resume_dummy_echoes_prompt_exactly() {
+        let mgr = SessionManager::new();
+        let received = Arc::new(StdMutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
+        let _ = mgr.execute_with_resume(AgentProvider::Dummy, "dummy prompt", move |chunk| {
+            received_clone.lock().unwrap().push_str(&chunk);
+        }).await;
+        assert_eq!(received.lock().unwrap().as_str(), "dummy prompt");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_resume_dummy_does_not_store_session() {
+        let mgr = SessionManager::new();
+        let _ = mgr.execute_with_resume(AgentProvider::Dummy, "test", |_| {}).await;
+        let sessions = mgr.session_ids.lock().await;
+        assert!(sessions.is_empty());
     }
 
     // ─── AgentExecutor::build_init_prompt tests ───────────────────────────────
