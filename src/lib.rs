@@ -39,8 +39,26 @@ impl SessionManager {
         }
     }
 
-    pub fn extract_session_id(output: &str) -> Option<String> {
+    fn extract_json_value(output: &str) -> Option<serde_json::Value> {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
+            return Some(v);
+        }
+
+        for (idx, ch) in output.char_indices() {
+            if ch != '{' {
+                continue;
+            }
+            let mut de = serde_json::Deserializer::from_str(&output[idx..]);
+            if let Ok(v) = serde_json::Value::deserialize(&mut de) {
+                return Some(v);
+            }
+        }
+
+        None
+    }
+
+    pub fn extract_session_id(output: &str) -> Option<String> {
+        if let Some(v) = Self::extract_json_value(output) {
             if let Some(id) = v.get("session_id").and_then(|v| v.as_str()) {
                 return Some(id.to_string());
             }
@@ -52,7 +70,7 @@ impl SessionManager {
     }
 
     pub fn extract_response(output: &str) -> Option<String> {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
+        if let Some(v) = Self::extract_json_value(output) {
             if let Some(res) = v.get("response").and_then(|v| v.as_str()) {
                 return Some(res.to_string());
             }
@@ -97,7 +115,16 @@ impl SessionManager {
 
             let output = seed_cmd.output().await?;
             if !output.status.success() {
-                return Err(format!("Seed turn failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    format!("stdout: {}", stdout)
+                } else {
+                    "no stdout/stderr output".to_string()
+                };
+                return Err(format!("Seed turn failed: {}", detail).into());
             }
             let out_str = String::from_utf8_lossy(&output.stdout);
             if let Some(id) = Self::extract_session_id(&out_str) {
@@ -387,6 +414,17 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_session_id_with_prefixed_logs_and_pretty_json() {
+        let output = r#"YOLO mode is enabled.
+Loaded cached credentials.
+{
+  "session_id": "prefixed-uuid",
+  "response": "MEMORY_READY"
+}"#;
+        assert_eq!(SessionManager::extract_session_id(output), Some("prefixed-uuid".to_string()));
+    }
+
+    #[test]
     fn test_extract_session_id_empty_string() {
         assert_eq!(SessionManager::extract_session_id(""), None);
     }
@@ -425,6 +463,17 @@ mod tests {
     #[test]
     fn test_extract_response_invalid_json() {
         assert_eq!(SessionManager::extract_response("not json"), None);
+    }
+
+    #[test]
+    fn test_extract_response_with_prefixed_logs_and_pretty_json() {
+        let output = r#"YOLO mode is enabled.
+[ERROR] [IDEClient] Failed to connect.
+{
+  "session_id": "abc",
+  "response": "Hello"
+}"#;
+        assert_eq!(SessionManager::extract_response(output), Some("Hello".to_string()));
     }
 
     #[test]
