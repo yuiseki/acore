@@ -41,6 +41,28 @@ impl SessionManager {
         }
     }
 
+    fn model_args_for_provider(provider: &AgentProvider, model: Option<&str>) -> Vec<String> {
+        let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+            return Vec::new();
+        };
+
+        match provider {
+            AgentProvider::Gemini
+            | AgentProvider::Claude
+            | AgentProvider::Codex
+            | AgentProvider::OpenCode => {
+                vec!["--model".to_string(), model.to_string()]
+            }
+            AgentProvider::Dummy | AgentProvider::Mock => Vec::new(),
+        }
+    }
+
+    fn apply_model_args(command: &mut Command, provider: &AgentProvider, model: Option<&str>) {
+        for arg in Self::model_args_for_provider(provider, model) {
+            command.arg(arg);
+        }
+    }
+
     fn find_in_json_output<T, F>(output: &str, mut pick: F) -> Option<T>
     where
         F: FnMut(&serde_json::Value) -> Option<T>,
@@ -105,6 +127,19 @@ impl SessionManager {
         &self,
         provider: AgentProvider,
         prompt: &str,
+        on_chunk: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(String) + Send + 'static,
+    {
+        self.execute_with_resume_with_model(provider, None, prompt, on_chunk).await
+    }
+
+    pub async fn execute_with_resume_with_model<F>(
+        &self,
+        provider: AgentProvider,
+        model: Option<String>,
+        prompt: &str,
         mut on_chunk: F,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
@@ -124,6 +159,7 @@ impl SessionManager {
 
         let mut session_ids = self.session_ids.lock().await;
         let cmd = provider.command_name();
+        let requested_model = model.as_deref();
         let mut current_id = session_ids.get(&provider).cloned();
 
         if current_id.is_none() {
@@ -136,15 +172,32 @@ impl SessionManager {
             
             match provider {
                 AgentProvider::Gemini => {
-                    seed_cmd.arg("--approval-mode").arg("yolo").arg("--output-format").arg("json").arg("-p").arg(&init_prompt);
+                    seed_cmd
+                        .arg("--approval-mode")
+                        .arg("yolo")
+                        .arg("--output-format")
+                        .arg("json");
+                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
+                    seed_cmd.arg("-p").arg(&init_prompt);
                 }
                 AgentProvider::Claude => {
-                    seed_cmd.arg("--dangerously-skip-permissions").arg("--output-format").arg("json").arg("--print").arg(&init_prompt);
+                    seed_cmd
+                        .arg("--dangerously-skip-permissions")
+                        .arg("--output-format")
+                        .arg("json")
+                        .arg("--print");
+                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
+                    seed_cmd.arg(&init_prompt);
                 }
                 AgentProvider::Codex => {
-                    seed_cmd.arg("exec").arg("--json").arg(&init_prompt);
+                    seed_cmd.arg("exec").arg("--json");
+                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
+                    seed_cmd.arg(&init_prompt);
                 }
-                _ => { seed_cmd.arg(&init_prompt); }
+                _ => {
+                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
+                    seed_cmd.arg(&init_prompt);
+                }
             }
 
             let output = seed_cmd.output().await?;
@@ -175,15 +228,28 @@ impl SessionManager {
 
         match provider {
             AgentProvider::Gemini => {
-                command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id).arg("-p").arg(prompt);
+                command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id);
+                Self::apply_model_args(&mut command, &provider, requested_model);
+                command.arg("-p").arg(prompt);
             }
             AgentProvider::Claude => {
-                command.arg("--dangerously-skip-permissions").arg("--resume").arg(id).arg("--print").arg(prompt);
+                command
+                    .arg("--dangerously-skip-permissions")
+                    .arg("--resume")
+                    .arg(id)
+                    .arg("--print");
+                Self::apply_model_args(&mut command, &provider, requested_model);
+                command.arg(prompt);
             }
             AgentProvider::Codex => {
-                command.arg("exec").arg("resume").arg("--json").arg(id).arg(prompt);
+                command.arg("exec").arg("resume").arg("--json");
+                Self::apply_model_args(&mut command, &provider, requested_model);
+                command.arg(id).arg(prompt);
             }
-            _ => { command.arg(prompt); }
+            _ => {
+                Self::apply_model_args(&mut command, &provider, requested_model);
+                command.arg(prompt);
+            }
         }
 
         if provider == AgentProvider::Codex {
@@ -482,6 +548,37 @@ mod tests {
         assert_eq!(format!("{:?}", AgentProvider::OpenCode), "OpenCode");
         assert_eq!(format!("{:?}", AgentProvider::Dummy), "Dummy");
         assert_eq!(format!("{:?}", AgentProvider::Mock), "Mock");
+    }
+
+    #[test]
+    fn test_model_args_for_provider_gemini() {
+        assert_eq!(
+            SessionManager::model_args_for_provider(&AgentProvider::Gemini, Some("gemini-2.5-flash-lite")),
+            vec!["--model".to_string(), "gemini-2.5-flash-lite".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_model_args_for_provider_claude() {
+        assert_eq!(
+            SessionManager::model_args_for_provider(&AgentProvider::Claude, Some("claude-sonnet-4-6")),
+            vec!["--model".to_string(), "claude-sonnet-4-6".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_model_args_for_provider_codex() {
+        assert_eq!(
+            SessionManager::model_args_for_provider(&AgentProvider::Codex, Some("gpt-5.3-codex")),
+            vec!["--model".to_string(), "gpt-5.3-codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_model_args_for_provider_none_returns_empty() {
+        assert!(
+            SessionManager::model_args_for_provider(&AgentProvider::Gemini, None).is_empty()
+        );
     }
 
     // ─── AgentProvider JSON serialization tests ───────────────────────────────────
