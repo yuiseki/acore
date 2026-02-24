@@ -39,9 +39,14 @@ impl SessionManager {
         }
     }
 
-    fn extract_json_value(output: &str) -> Option<serde_json::Value> {
+    fn find_in_json_output<T, F>(output: &str, mut pick: F) -> Option<T>
+    where
+        F: FnMut(&serde_json::Value) -> Option<T>,
+    {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
-            return Some(v);
+            if let Some(found) = pick(&v) {
+                return Some(found);
+            }
         }
 
         for (idx, ch) in output.char_indices() {
@@ -50,7 +55,9 @@ impl SessionManager {
             }
             let mut de = serde_json::Deserializer::from_str(&output[idx..]);
             if let Ok(v) = serde_json::Value::deserialize(&mut de) {
-                return Some(v);
+                if let Some(found) = pick(&v) {
+                    return Some(found);
+                }
             }
         }
 
@@ -58,24 +65,38 @@ impl SessionManager {
     }
 
     pub fn extract_session_id(output: &str) -> Option<String> {
-        if let Some(v) = Self::extract_json_value(output) {
+        Self::find_in_json_output(output, |v| {
             if let Some(id) = v.get("session_id").and_then(|v| v.as_str()) {
                 return Some(id.to_string());
             }
             if let Some(id) = v.get("sessionId").and_then(|v| v.as_str()) {
                 return Some(id.to_string());
             }
-        }
-        None
+            if let Some(id) = v.get("thread_id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+            if let Some(id) = v.get("threadId").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+            None
+        })
     }
 
     pub fn extract_response(output: &str) -> Option<String> {
-        if let Some(v) = Self::extract_json_value(output) {
+        Self::find_in_json_output(output, |v| {
             if let Some(res) = v.get("response").and_then(|v| v.as_str()) {
                 return Some(res.to_string());
             }
-        }
-        None
+            if let Some(item) = v.get("item") {
+                let is_agent_message = item.get("type").and_then(|t| t.as_str()) == Some("agent_message");
+                if is_agent_message {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            None
+        })
     }
 
     pub async fn execute_with_resume<F>(
@@ -109,6 +130,9 @@ impl SessionManager {
                 }
                 AgentProvider::Claude => {
                     seed_cmd.arg("--dangerously-skip-permissions").arg("--output-format").arg("json").arg("--print").arg(&init_prompt);
+                }
+                AgentProvider::Codex => {
+                    seed_cmd.arg("exec").arg("--json").arg(&init_prompt);
                 }
                 _ => { seed_cmd.arg(&init_prompt); }
             }
@@ -146,7 +170,34 @@ impl SessionManager {
             AgentProvider::Claude => {
                 command.arg("--dangerously-skip-permissions").arg("--resume").arg(id).arg("--print").arg(prompt);
             }
+            AgentProvider::Codex => {
+                command.arg("exec").arg("resume").arg("--json").arg(id).arg(prompt);
+            }
             _ => { command.arg(prompt); }
+        }
+
+        if provider == AgentProvider::Codex {
+            let output = command.output().await?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    format!("stdout: {}", stdout)
+                } else {
+                    "no stdout/stderr output".to_string()
+                };
+                return Err(format!("codex exited with error:\n{}", detail).into());
+            }
+
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Some(response) = Self::extract_response(&out_str) {
+                on_chunk(response);
+                return Ok(());
+            }
+
+            return Err("Failed to extract response from codex exec resume JSON output.".into());
         }
 
         let mut child = command.spawn().map_err(|e| format!("Failed to spawn {}: {}", cmd, e))?;
@@ -251,6 +302,38 @@ impl AgentExecutor {
             return Ok(());
         }
 
+        if provider == AgentProvider::Codex {
+            let output = Command::new(provider.command_name())
+                .arg("exec")
+                .arg("--json")
+                .arg(prompt)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() {
+                    stderr
+                } else if !stdout.is_empty() {
+                    format!("stdout: {}", stdout)
+                } else {
+                    "no stdout/stderr output".to_string()
+                };
+                return Err(format!("codex exec failed: {}", detail).into());
+            }
+
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            if let Some(response) = SessionManager::extract_response(&out_str) {
+                on_chunk(response);
+                return Ok(());
+            }
+
+            return Err("Failed to extract response from codex exec JSON output.".into());
+        }
+
         let mut child = Command::new(provider.command_name())
             .arg(prompt)
             .stdout(Stdio::piped())
@@ -277,10 +360,29 @@ impl AgentExecutor {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if provider == AgentProvider::Mock { return Ok(()); }
         if transcript.is_empty() || !Self::has_amem().await { return Ok(()); }
-        let output = Command::new(provider.command_name())
-            .arg(format!("対話内容をAgentの活動ログとして1行で要約せよ：\n{}", transcript))
-            .output().await?;
-        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let prompt = format!("対話内容をAgentの活動ログとして1行で要約せよ：\n{}", transcript);
+        let output = if provider == AgentProvider::Codex {
+            Command::new(provider.command_name())
+                .arg("exec")
+                .arg("--json")
+                .arg(&prompt)
+                .output()
+                .await?
+        } else {
+            Command::new(provider.command_name())
+                .arg(&prompt)
+                .output()
+                .await?
+        };
+
+        let line = if provider == AgentProvider::Codex {
+            SessionManager::extract_response(&String::from_utf8_lossy(&output.stdout))
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        } else {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
         if !line.is_empty() {
             let _ = Command::new("amem").arg("keep").arg(line).arg("--kind").arg("activity").arg("--source").arg("yuiclaw").status().await;
         }
@@ -425,6 +527,17 @@ Loaded cached credentials.
     }
 
     #[test]
+    fn test_extract_session_id_from_codex_jsonl_thread_started() {
+        let output = r#"{"type":"thread.started","thread_id":"019c8d31-7d21-76d1-8a4e-2b3443def1c6"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"MEMORY_READY"}}"#;
+        assert_eq!(
+            SessionManager::extract_session_id(output),
+            Some("019c8d31-7d21-76d1-8a4e-2b3443def1c6".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_session_id_empty_string() {
         assert_eq!(SessionManager::extract_session_id(""), None);
     }
@@ -474,6 +587,15 @@ Loaded cached credentials.
   "response": "Hello"
 }"#;
         assert_eq!(SessionManager::extract_response(output), Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn test_extract_response_from_codex_jsonl_agent_message() {
+        let output = r#"{"type":"thread.started","thread_id":"019c8d31-7d21-76d1-8a4e-2b3443def1c6"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"hidden"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"SECOND"}}"#;
+        assert_eq!(SessionManager::extract_response(output), Some("SECOND".to_string()));
     }
 
     #[test]
