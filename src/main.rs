@@ -1,5 +1,5 @@
 use clap::Parser;
-use acore::{AgentExecutor, AgentTool};
+use acore::{AgentExecutor, AgentProvider};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -21,11 +21,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
     let tool = match args.tool.as_str() {
-        "gemini" => AgentTool::Gemini,
-        "claude" => AgentTool::Claude,
-        "codex" => AgentTool::Codex,
-        "opencode" => AgentTool::OpenCode,
-        _ => AgentTool::Gemini,
+        "gemini" => AgentProvider::Gemini,
+        "claude" => AgentProvider::Claude,
+        "codex" => AgentProvider::Codex,
+        "opencode" => AgentProvider::OpenCode,
+        _ => AgentProvider::Gemini,
     };
 
     // ストリーミング実行（標準出力に出力）

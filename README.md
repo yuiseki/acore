@@ -34,9 +34,9 @@ flowchart TD
 
 Roles of each component:
 
-- `SessionManager` — maintains a `HashMap<AgentTool, session_id>` shared across threads (via `Arc<Mutex>`). On the first call for a given tool it seeds a new session, injecting the amem context snapshot. Subsequent calls resume the existing session.
+- `SessionManager` — maintains a `HashMap<AgentProvider, session_id>` shared across threads (via `Arc<Mutex>`). On the first call for a given tool it seeds a new session, injecting the amem context snapshot. Subsequent calls resume the existing session.
 - `AgentExecutor` — stateless helper for one-shot streaming execution and amem integration.
-- `AgentTool` — enum with variants `Gemini`, `Claude`, `Codex`, `OpenCode`, `Mock`. Implements `Clone`, `Hash`, `Eq`, `Serialize`, `Deserialize`.
+- `AgentProvider` — enum with variants `Gemini`, `Claude`, `Codex`, `OpenCode`, `Mock`. Implements `Clone`, `Hash`, `Eq`, `Serialize`, `Deserialize`.
 
 ## Supported Tools
 
@@ -55,13 +55,13 @@ Roles of each component:
 ### SessionManager — stateful resume
 
 ```rust
-use acore::{SessionManager, AgentTool};
+use acore::{SessionManager, AgentProvider};
 
 let manager = SessionManager::new();
 
 // First call seeds the session with amem context and captures the session_id.
 // Subsequent calls resume that session automatically.
-manager.execute_with_resume(AgentTool::Gemini, "Hello", |chunk| {
+manager.execute_with_resume(AgentProvider::Gemini, "Hello", |chunk| {
     print!("{}", chunk);
 }).await?;
 ```
@@ -69,9 +69,9 @@ manager.execute_with_resume(AgentTool::Gemini, "Hello", |chunk| {
 ### AgentExecutor — stateless streaming
 
 ```rust
-use acore::{AgentExecutor, AgentTool};
+use acore::{AgentExecutor, AgentProvider};
 
-AgentExecutor::execute_stream(AgentTool::Claude, "Summarise the repo", |chunk| {
+AgentExecutor::execute_stream(AgentProvider::Claude, "Summarise the repo", |chunk| {
     print!("{}", chunk);
 }).await?;
 ```
@@ -86,7 +86,7 @@ let context = AgentExecutor::fetch_context().await;
 let prompt = AgentExecutor::build_init_prompt().await;
 
 // Summarise a transcript and record it as an amem activity entry
-AgentExecutor::summarize_and_record(AgentTool::Gemini, &transcript).await?;
+AgentExecutor::summarize_and_record(AgentProvider::Gemini, &transcript).await?;
 ```
 
 ## Technical Details

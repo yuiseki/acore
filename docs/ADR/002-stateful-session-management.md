@@ -11,7 +11,7 @@ Implement a persistent process pool within `acore`.
 
 ### 1. Persistent Process Strategy
 - Instead of short-lived `Command::output()`, use long-lived `tokio::process::Child`.
-- Maintain a pool of active processes, indexed by `AgentTool`.
+- Maintain a pool of active processes, indexed by `AgentProvider`.
 - Communication happens via `stdin` (for prompts) and `stdout` (for streaming responses).
 
 ### 2. Context Continuity
