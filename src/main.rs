@@ -1,5 +1,5 @@
-use clap::Parser;
 use acore::{AgentExecutor, AgentProvider};
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,7 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ストリーミング実行（標準出力に出力）
     AgentExecutor::execute_stream(provider.clone(), &args.prompt, |line| {
         println!("{}", line);
-    }).await?;
+    })
+    .await?;
 
     // 必要に応じて amem に記録
     if args.record {

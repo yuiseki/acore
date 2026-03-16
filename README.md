@@ -49,6 +49,8 @@ Roles of each component:
 | `Mock` | — | (in-process echo) | — |
 
 > **Note:** Codex and OpenCode do not expose a session resume flag at the CLI level; `acore` treats each call as stateless for those tools.
+>
+> **Gemini capacity fallback:** when a Gemini turn fails with a server-side `429 / No capacity available` error while using `auto-gemini-3`, `acore` keeps the requested default model but retries the failed turn with a narrower fallback sequence (`gemini-2.5-flash`, then `gemini-2.5-pro`).
 
 ## Usage
 

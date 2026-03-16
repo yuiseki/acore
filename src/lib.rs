@@ -1,9 +1,9 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
@@ -32,6 +32,12 @@ impl AgentProvider {
 #[derive(Clone)]
 pub struct SessionManager {
     session_ids: Arc<Mutex<HashMap<AgentProvider, String>>>,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionManager {
@@ -63,14 +69,39 @@ impl SessionManager {
         }
     }
 
+    fn is_gemini_capacity_error(detail: &str) -> bool {
+        let lower = detail.to_ascii_lowercase();
+        lower.contains("no capacity available for model")
+            || (lower.contains("status 429") && lower.contains("gemini"))
+            || (lower.contains("attempt 1 failed with status 429") && lower.contains("gemini"))
+    }
+
+    fn gemini_capacity_fallback_models(model: Option<&str>) -> &'static [&'static str] {
+        match model.map(str::trim).filter(|m| !m.is_empty()) {
+            None | Some("auto-gemini-3") => &["gemini-2.5-flash", "gemini-2.5-pro"],
+            Some("gemini-2.5-flash") => &["gemini-2.5-pro"],
+            _ => &[],
+        }
+    }
+
+    fn gemini_should_retry_with_fallback(
+        provider: &AgentProvider,
+        requested_model: Option<&str>,
+        detail: &str,
+    ) -> bool {
+        *provider == AgentProvider::Gemini
+            && Self::is_gemini_capacity_error(detail)
+            && !Self::gemini_capacity_fallback_models(requested_model).is_empty()
+    }
+
     fn find_in_json_output<T, F>(output: &str, mut pick: F) -> Option<T>
     where
         F: FnMut(&serde_json::Value) -> Option<T>,
     {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
-            if let Some(found) = pick(&v) {
-                return Some(found);
-            }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(output)
+            && let Some(found) = pick(&v)
+        {
+            return Some(found);
         }
 
         for (idx, ch) in output.char_indices() {
@@ -78,10 +109,10 @@ impl SessionManager {
                 continue;
             }
             let mut de = serde_json::Deserializer::from_str(&output[idx..]);
-            if let Ok(v) = serde_json::Value::deserialize(&mut de) {
-                if let Some(found) = pick(&v) {
-                    return Some(found);
-                }
+            if let Ok(v) = serde_json::Value::deserialize(&mut de)
+                && let Some(found) = pick(&v)
+            {
+                return Some(found);
             }
         }
 
@@ -112,11 +143,10 @@ impl SessionManager {
                 return Some(res.to_string());
             }
             if let Some(item) = v.get("item") {
-                let is_agent_message = item.get("type").and_then(|t| t.as_str()) == Some("agent_message");
-                if is_agent_message {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        return Some(text.to_string());
-                    }
+                let is_agent_message =
+                    item.get("type").and_then(|t| t.as_str()) == Some("agent_message");
+                if is_agent_message && let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    return Some(text.to_string());
                 }
             }
             None
@@ -132,7 +162,8 @@ impl SessionManager {
     where
         F: FnMut(String) + Send + 'static,
     {
-        self.execute_with_resume_with_model(provider, None, prompt, on_chunk).await
+        self.execute_with_resume_with_model(provider, None, prompt, on_chunk)
+            .await
     }
 
     pub async fn execute_with_resume_with_model<F>(
@@ -161,75 +192,128 @@ impl SessionManager {
         let cmd = provider.command_name();
         let requested_model = model.as_deref();
         let mut current_id = session_ids.get(&provider).cloned();
+        let mut active_model = model.clone();
 
         if current_id.is_none() {
             let init_prompt = AgentExecutor::build_init_prompt().await;
-            let mut seed_cmd = Command::new(cmd);
-            // stdin must be null so CLI tools (especially claude) do not try to
-            // call setRawMode on an inherited non-TTY stdin (which causes EIO when
-            // running as a background service / Discord adapter).
-            seed_cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-            
-            match provider {
-                AgentProvider::Gemini => {
-                    seed_cmd
-                        .arg("--approval-mode")
-                        .arg("yolo")
-                        .arg("--output-format")
-                        .arg("json");
-                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
-                    seed_cmd.arg("-p").arg(&init_prompt);
-                }
-                AgentProvider::Claude => {
-                    seed_cmd
-                        .arg("--dangerously-skip-permissions")
-                        .arg("--output-format")
-                        .arg("json")
-                        .arg("--print");
-                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
-                    seed_cmd.arg(&init_prompt);
-                }
-                AgentProvider::Codex => {
-                    seed_cmd.arg("exec").arg("--json");
-                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
-                    seed_cmd.arg(&init_prompt);
-                }
-                _ => {
-                    Self::apply_model_args(&mut seed_cmd, &provider, requested_model);
-                    seed_cmd.arg(&init_prompt);
+            let mut seed_models: Vec<Option<String>> = vec![active_model.clone()];
+            if provider == AgentProvider::Gemini {
+                for fallback in Self::gemini_capacity_fallback_models(requested_model) {
+                    seed_models.push(Some((*fallback).to_string()));
                 }
             }
 
-            let output = seed_cmd.output().await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let detail = if !stderr.is_empty() {
-                    stderr
-                } else if !stdout.is_empty() {
-                    format!("stdout: {}", stdout)
-                } else {
-                    "no stdout/stderr output".to_string()
-                };
-                return Err(format!("Seed turn failed: {}", detail).into());
+            let mut last_seed_detail: Option<String> = None;
+            for candidate_model in seed_models {
+                let mut seed_cmd = Command::new(cmd);
+                // stdin must be null so CLI tools (especially claude) do not try to
+                // call setRawMode on an inherited non-TTY stdin (which causes EIO when
+                // running as a background service / Discord adapter).
+                seed_cmd
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                match provider {
+                    AgentProvider::Gemini => {
+                        seed_cmd
+                            .arg("--approval-mode")
+                            .arg("yolo")
+                            .arg("--output-format")
+                            .arg("json");
+                        Self::apply_model_args(
+                            &mut seed_cmd,
+                            &provider,
+                            candidate_model.as_deref(),
+                        );
+                        seed_cmd.arg("-p").arg(&init_prompt);
+                    }
+                    AgentProvider::Claude => {
+                        seed_cmd
+                            .arg("--dangerously-skip-permissions")
+                            .arg("--output-format")
+                            .arg("json")
+                            .arg("--print");
+                        Self::apply_model_args(
+                            &mut seed_cmd,
+                            &provider,
+                            candidate_model.as_deref(),
+                        );
+                        seed_cmd.arg(&init_prompt);
+                    }
+                    AgentProvider::Codex => {
+                        seed_cmd.arg("exec").arg("--json");
+                        Self::apply_model_args(
+                            &mut seed_cmd,
+                            &provider,
+                            candidate_model.as_deref(),
+                        );
+                        seed_cmd.arg(&init_prompt);
+                    }
+                    _ => {
+                        Self::apply_model_args(
+                            &mut seed_cmd,
+                            &provider,
+                            candidate_model.as_deref(),
+                        );
+                        seed_cmd.arg(&init_prompt);
+                    }
+                }
+
+                let output = seed_cmd.output().await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let detail = if !stderr.is_empty() {
+                        stderr
+                    } else if !stdout.is_empty() {
+                        format!("stdout: {}", stdout)
+                    } else {
+                        "no stdout/stderr output".to_string()
+                    };
+                    last_seed_detail = Some(detail.clone());
+                    if Self::gemini_should_retry_with_fallback(
+                        &provider,
+                        candidate_model.as_deref(),
+                        &detail,
+                    ) {
+                        continue;
+                    }
+                    return Err(format!("Seed turn failed: {}", detail).into());
+                }
+
+                let out_str = String::from_utf8_lossy(&output.stdout);
+                if let Some(id) = Self::extract_session_id(&out_str) {
+                    session_ids.insert(provider.clone(), id.clone());
+                    current_id = Some(id);
+                    active_model = candidate_model;
+                    break;
+                }
+                last_seed_detail = Some("Failed to extract session_id from seed turn.".to_string());
             }
-            let out_str = String::from_utf8_lossy(&output.stdout);
-            if let Some(id) = Self::extract_session_id(&out_str) {
-                session_ids.insert(provider.clone(), id.clone());
-                current_id = Some(id);
-            } else {
-                return Err("Failed to extract session_id from seed turn.".into());
+
+            if current_id.is_none() {
+                return Err(last_seed_detail
+                    .unwrap_or_else(|| "Failed to extract session_id from seed turn.".to_string())
+                    .into());
             }
         }
 
         let mut command = Command::new(cmd);
-        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let id = current_id.unwrap();
 
         match provider {
             AgentProvider::Gemini => {
-                command.arg("--approval-mode").arg("yolo").arg("--resume").arg(id);
-                Self::apply_model_args(&mut command, &provider, requested_model);
+                command
+                    .arg("--approval-mode")
+                    .arg("yolo")
+                    .arg("--resume")
+                    .arg(id);
+                Self::apply_model_args(&mut command, &provider, active_model.as_deref());
                 command.arg("-p").arg(prompt);
             }
             AgentProvider::Claude => {
@@ -238,16 +322,16 @@ impl SessionManager {
                     .arg("--resume")
                     .arg(id)
                     .arg("--print");
-                Self::apply_model_args(&mut command, &provider, requested_model);
+                Self::apply_model_args(&mut command, &provider, active_model.as_deref());
                 command.arg(prompt);
             }
             AgentProvider::Codex => {
                 command.arg("exec").arg("resume").arg("--json");
-                Self::apply_model_args(&mut command, &provider, requested_model);
+                Self::apply_model_args(&mut command, &provider, active_model.as_deref());
                 command.arg(id).arg(prompt);
             }
             _ => {
-                Self::apply_model_args(&mut command, &provider, requested_model);
+                Self::apply_model_args(&mut command, &provider, active_model.as_deref());
                 command.arg(prompt);
             }
         }
@@ -276,16 +360,22 @@ impl SessionManager {
             return Err("Failed to extract response from codex exec resume JSON output.".into());
         }
 
-        let mut child = command.spawn().map_err(|e| format!("Failed to spawn {}: {}", cmd, e))?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("Failed to spawn {}: {}", cmd, e))?;
         let mut stdout = child.stdout.take().ok_or("Failed to open stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
         let mut err_reader = BufReader::new(stderr).lines();
 
         let mut buffer = [0; 1024];
+        let mut saw_output = false;
         loop {
             let n = stdout.read(&mut buffer).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
+            saw_output = true;
             on_chunk(chunk);
         }
 
@@ -295,6 +385,27 @@ impl SessionManager {
             while let Ok(Some(line)) = err_reader.next_line().await {
                 err_msg.push_str(&line);
                 err_msg.push('\n');
+            }
+            if !saw_output
+                && Self::gemini_should_retry_with_fallback(
+                    &provider,
+                    active_model.as_deref(),
+                    &err_msg,
+                )
+            {
+                for fallback in Self::gemini_capacity_fallback_models(active_model.as_deref()) {
+                    let fallback_model = Some((*fallback).to_string());
+                    if fallback_model == active_model {
+                        continue;
+                    }
+                    return Box::pin(self.execute_with_resume_with_model(
+                        provider,
+                        fallback_model,
+                        prompt,
+                        on_chunk,
+                    ))
+                    .await;
+                }
             }
             return Err(format!("{} exited with error:\n{}", cmd, err_msg).into());
         }
@@ -320,14 +431,23 @@ impl AgentExecutor {
     /// amem の記憶から Snapshot 文字列を取得します
     pub async fn fetch_context() -> String {
         let mut context = String::new();
-        if !Self::has_amem().await { return context; }
+        if !Self::has_amem().await {
+            return context;
+        }
 
-        let output = match Command::new("amem").arg("today").arg("--json").output().await {
+        let output = match Command::new("amem")
+            .arg("today")
+            .arg("--json")
+            .output()
+            .await
+        {
             Ok(o) => o,
             Err(_) => return context,
         };
-        if !output.status.success() { return context; }
-        
+        if !output.status.success() {
+            return context;
+        }
+
         let today: serde_json::Value = match serde_json::from_slice(&output.stdout) {
             Ok(t) => t,
             Err(_) => return context,
@@ -360,9 +480,14 @@ impl AgentExecutor {
     pub async fn build_init_prompt() -> String {
         let context = Self::fetch_context().await;
         if context.is_empty() {
-            return String::from("Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n(amem context is empty or unavailable)");
+            return String::from(
+                "Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n(amem context is empty or unavailable)",
+            );
         }
-        format!("Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n{}", context)
+        format!(
+            "Load this amem snapshot for the next interactive session and reply exactly `MEMORY_READY`.\n\n{}",
+            context
+        )
     }
 
     pub async fn execute_stream<F>(
@@ -424,10 +549,12 @@ impl AgentExecutor {
 
         let mut stdout = child.stdout.take().ok_or("Failed to open stdout")?;
         let mut buffer = [0; 1024];
-        
+
         loop {
             let n = stdout.read(&mut buffer).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let chunk = String::from_utf8_lossy(&buffer[..n]).to_string();
             on_chunk(chunk);
         }
@@ -440,9 +567,16 @@ impl AgentExecutor {
         provider: AgentProvider,
         transcript: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if provider == AgentProvider::Mock || provider == AgentProvider::Dummy { return Ok(()); }
-        if transcript.is_empty() || !Self::has_amem().await { return Ok(()); }
-        let prompt = format!("対話内容をAgentの活動ログとして1行で要約せよ：\n{}", transcript);
+        if provider == AgentProvider::Mock || provider == AgentProvider::Dummy {
+            return Ok(());
+        }
+        if transcript.is_empty() || !Self::has_amem().await {
+            return Ok(());
+        }
+        let prompt = format!(
+            "対話内容をAgentの活動ログとして1行で要約せよ：\n{}",
+            transcript
+        );
         let output = if provider == AgentProvider::Codex {
             Command::new(provider.command_name())
                 .arg("exec")
@@ -466,7 +600,15 @@ impl AgentExecutor {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         if !line.is_empty() {
-            let _ = Command::new("amem").arg("keep").arg(line).arg("--kind").arg("activity").arg("--source").arg("yuiclaw").status().await;
+            let _ = Command::new("amem")
+                .arg("keep")
+                .arg(line)
+                .arg("--kind")
+                .arg("activity")
+                .arg("--source")
+                .arg("yuiclaw")
+                .status()
+                .await;
         }
         Ok(())
     }
@@ -553,7 +695,10 @@ mod tests {
     #[test]
     fn test_model_args_for_provider_gemini() {
         assert_eq!(
-            SessionManager::model_args_for_provider(&AgentProvider::Gemini, Some("gemini-2.5-flash-lite")),
+            SessionManager::model_args_for_provider(
+                &AgentProvider::Gemini,
+                Some("gemini-2.5-flash-lite")
+            ),
             vec!["--model".to_string(), "gemini-2.5-flash-lite".to_string()]
         );
     }
@@ -561,7 +706,10 @@ mod tests {
     #[test]
     fn test_model_args_for_provider_claude() {
         assert_eq!(
-            SessionManager::model_args_for_provider(&AgentProvider::Claude, Some("claude-sonnet-4-6")),
+            SessionManager::model_args_for_provider(
+                &AgentProvider::Claude,
+                Some("claude-sonnet-4-6")
+            ),
             vec!["--model".to_string(), "claude-sonnet-4-6".to_string()]
         );
     }
@@ -576,9 +724,55 @@ mod tests {
 
     #[test]
     fn test_model_args_for_provider_none_returns_empty() {
-        assert!(
-            SessionManager::model_args_for_provider(&AgentProvider::Gemini, None).is_empty()
+        assert!(SessionManager::model_args_for_provider(&AgentProvider::Gemini, None).is_empty());
+    }
+
+    #[test]
+    fn test_is_gemini_capacity_error_detects_no_capacity_message() {
+        let detail = "Attempt 1 failed with status 429. Retrying with backoff... GaxiosError: No capacity available for model gemini-2.5-flash-lite on the server";
+        assert!(SessionManager::is_gemini_capacity_error(detail));
+    }
+
+    #[test]
+    fn test_is_gemini_capacity_error_ignores_unrelated_errors() {
+        let detail = "Bridge is not running. Please start it with 'acomm --bridge'.";
+        assert!(!SessionManager::is_gemini_capacity_error(detail));
+    }
+
+    #[test]
+    fn test_gemini_capacity_fallback_models_for_auto_gemini_3() {
+        assert_eq!(
+            SessionManager::gemini_capacity_fallback_models(Some("auto-gemini-3")),
+            &["gemini-2.5-flash", "gemini-2.5-pro"]
         );
+    }
+
+    #[test]
+    fn test_gemini_capacity_fallback_models_for_flash() {
+        assert_eq!(
+            SessionManager::gemini_capacity_fallback_models(Some("gemini-2.5-flash")),
+            &["gemini-2.5-pro"]
+        );
+    }
+
+    #[test]
+    fn test_gemini_should_retry_with_fallback_only_for_gemini_capacity_errors() {
+        let detail = "No capacity available for model gemini-2.5-flash-lite on the server";
+        assert!(SessionManager::gemini_should_retry_with_fallback(
+            &AgentProvider::Gemini,
+            Some("auto-gemini-3"),
+            detail,
+        ));
+        assert!(!SessionManager::gemini_should_retry_with_fallback(
+            &AgentProvider::Claude,
+            Some("claude-sonnet-4-6"),
+            detail,
+        ));
+        assert!(!SessionManager::gemini_should_retry_with_fallback(
+            &AgentProvider::Gemini,
+            Some("gemini-2.5-pro"),
+            "permission denied",
+        ));
     }
 
     // ─── AgentProvider JSON serialization tests ───────────────────────────────────
@@ -597,7 +791,14 @@ mod tests {
 
     #[test]
     fn test_agent_provider_roundtrip_all_variants() {
-        for provider in [AgentProvider::Gemini, AgentProvider::Claude, AgentProvider::Codex, AgentProvider::OpenCode, AgentProvider::Dummy, AgentProvider::Mock] {
+        for provider in [
+            AgentProvider::Gemini,
+            AgentProvider::Claude,
+            AgentProvider::Codex,
+            AgentProvider::OpenCode,
+            AgentProvider::Dummy,
+            AgentProvider::Mock,
+        ] {
             let json = serde_json::to_string(&provider).unwrap();
             let roundtrip: AgentProvider = serde_json::from_str(&json).unwrap();
             assert_eq!(provider, roundtrip);
@@ -609,20 +810,29 @@ mod tests {
     #[test]
     fn test_extract_session_id() {
         let json_output = r#"{"session_id": "test-uuid-1234", "status": "ok"}"#;
-        assert_eq!(SessionManager::extract_session_id(json_output), Some("test-uuid-1234".to_string()));
+        assert_eq!(
+            SessionManager::extract_session_id(json_output),
+            Some("test-uuid-1234".to_string())
+        );
     }
 
     #[test]
     fn test_extract_session_id_camel_case() {
         let json_output = r#"{"sessionId": "camel-uuid-5678", "status": "ok"}"#;
-        assert_eq!(SessionManager::extract_session_id(json_output), Some("camel-uuid-5678".to_string()));
+        assert_eq!(
+            SessionManager::extract_session_id(json_output),
+            Some("camel-uuid-5678".to_string())
+        );
     }
 
     #[test]
     fn test_extract_session_id_snake_case_takes_priority() {
         // Both fields present: snake_case should win (checked first)
         let json_output = r#"{"session_id": "snake-id", "sessionId": "camel-id"}"#;
-        assert_eq!(SessionManager::extract_session_id(json_output), Some("snake-id".to_string()));
+        assert_eq!(
+            SessionManager::extract_session_id(json_output),
+            Some("snake-id".to_string())
+        );
     }
 
     #[test]
@@ -644,7 +854,10 @@ Loaded cached credentials.
   "session_id": "prefixed-uuid",
   "response": "MEMORY_READY"
 }"#;
-        assert_eq!(SessionManager::extract_session_id(output), Some("prefixed-uuid".to_string()));
+        assert_eq!(
+            SessionManager::extract_session_id(output),
+            Some("prefixed-uuid".to_string())
+        );
     }
 
     #[test]
@@ -685,7 +898,10 @@ Loaded cached credentials.
     #[test]
     fn test_extract_response() {
         let json_output = r#"{"session_id": "abc", "response": "Hello, world!"}"#;
-        assert_eq!(SessionManager::extract_response(json_output), Some("Hello, world!".to_string()));
+        assert_eq!(
+            SessionManager::extract_response(json_output),
+            Some("Hello, world!".to_string())
+        );
     }
 
     #[test]
@@ -707,7 +923,10 @@ Loaded cached credentials.
   "session_id": "abc",
   "response": "Hello"
 }"#;
-        assert_eq!(SessionManager::extract_response(output), Some("Hello".to_string()));
+        assert_eq!(
+            SessionManager::extract_response(output),
+            Some("Hello".to_string())
+        );
     }
 
     #[test]
@@ -716,7 +935,10 @@ Loaded cached credentials.
 {"type":"turn.started"}
 {"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"hidden"}}
 {"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"SECOND"}}"#;
-        assert_eq!(SessionManager::extract_response(output), Some("SECOND".to_string()));
+        assert_eq!(
+            SessionManager::extract_response(output),
+            Some("SECOND".to_string())
+        );
     }
 
     #[test]
@@ -727,13 +949,19 @@ Loaded cached credentials.
     #[test]
     fn test_extract_response_empty_value() {
         let json_output = r#"{"response": ""}"#;
-        assert_eq!(SessionManager::extract_response(json_output), Some("".to_string()));
+        assert_eq!(
+            SessionManager::extract_response(json_output),
+            Some("".to_string())
+        );
     }
 
     #[test]
     fn test_extract_response_multiline_value() {
         let json_output = r#"{"response": "line1\nline2\nline3"}"#;
-        assert_eq!(SessionManager::extract_response(json_output), Some("line1\nline2\nline3".to_string()));
+        assert_eq!(
+            SessionManager::extract_response(json_output),
+            Some("line1\nline2\nline3".to_string())
+        );
     }
 
     #[test]
@@ -756,9 +984,17 @@ Loaded cached credentials.
         let mgr = SessionManager::new();
         let cloned = mgr.clone();
         // Insert into original
-        mgr.session_ids.lock().await.insert(AgentProvider::Gemini, "shared-id".to_string());
+        mgr.session_ids
+            .lock()
+            .await
+            .insert(AgentProvider::Gemini, "shared-id".to_string());
         // Clone should see the same value (Arc-shared)
-        let val = cloned.session_ids.lock().await.get(&AgentProvider::Gemini).cloned();
+        let val = cloned
+            .session_ids
+            .lock()
+            .await
+            .get(&AgentProvider::Gemini)
+            .cloned();
         assert_eq!(val, Some("shared-id".to_string()));
     }
 
@@ -770,7 +1006,8 @@ Loaded cached credentials.
         let received_clone = Arc::clone(&received);
         let _ = AgentExecutor::execute_stream(AgentProvider::Mock, "test", move |chunk| {
             received_clone.lock().unwrap().push_str(&chunk);
-        }).await;
+        })
+        .await;
         assert_eq!(*received.lock().unwrap(), "Mock stream: pong");
     }
 
@@ -786,7 +1023,8 @@ Loaded cached credentials.
         let count_clone = Arc::clone(&count);
         let _ = AgentExecutor::execute_stream(AgentProvider::Mock, "hello", move |_| {
             *count_clone.lock().unwrap() += 1;
-        }).await;
+        })
+        .await;
         assert_eq!(*count.lock().unwrap(), 1);
     }
 
@@ -796,7 +1034,8 @@ Loaded cached credentials.
         let received_clone = Arc::clone(&received);
         let _ = AgentExecutor::execute_stream(AgentProvider::Dummy, "echo me", move |chunk| {
             received_clone.lock().unwrap().push_str(&chunk);
-        }).await;
+        })
+        .await;
         assert_eq!(*received.lock().unwrap(), "echo me");
     }
 
@@ -805,7 +1044,9 @@ Loaded cached credentials.
     #[tokio::test]
     async fn test_execute_with_resume_mock_succeeds() {
         let mgr = SessionManager::new();
-        let result = mgr.execute_with_resume(AgentProvider::Mock, "hello", |_| {}).await;
+        let result = mgr
+            .execute_with_resume(AgentProvider::Mock, "hello", |_| {})
+            .await;
         assert!(result.is_ok());
     }
 
@@ -814,17 +1055,25 @@ Loaded cached credentials.
         let mgr = SessionManager::new();
         let received = Arc::new(StdMutex::new(String::new()));
         let received_clone = Arc::clone(&received);
-        let _ = mgr.execute_with_resume(AgentProvider::Mock, "my prompt", move |chunk| {
-            received_clone.lock().unwrap().push_str(&chunk);
-        }).await;
+        let _ = mgr
+            .execute_with_resume(AgentProvider::Mock, "my prompt", move |chunk| {
+                received_clone.lock().unwrap().push_str(&chunk);
+            })
+            .await;
         let result = received.lock().unwrap().clone();
-        assert!(result.contains("my prompt"), "Expected 'my prompt' in '{}'", result);
+        assert!(
+            result.contains("my prompt"),
+            "Expected 'my prompt' in '{}'",
+            result
+        );
     }
 
     #[tokio::test]
     async fn test_execute_with_resume_mock_does_not_store_session() {
         let mgr = SessionManager::new();
-        let _ = mgr.execute_with_resume(AgentProvider::Mock, "test", |_| {}).await;
+        let _ = mgr
+            .execute_with_resume(AgentProvider::Mock, "test", |_| {})
+            .await;
         // Mock should not pollute the session store
         let sessions = mgr.session_ids.lock().await;
         assert!(sessions.is_empty());
@@ -834,7 +1083,9 @@ Loaded cached credentials.
     async fn test_execute_with_resume_mock_multiple_calls_succeed() {
         let mgr = SessionManager::new();
         for i in 0..3 {
-            let result = mgr.execute_with_resume(AgentProvider::Mock, &format!("prompt {}", i), |_| {}).await;
+            let result = mgr
+                .execute_with_resume(AgentProvider::Mock, &format!("prompt {}", i), |_| {})
+                .await;
             assert!(result.is_ok(), "Call {} should succeed", i);
         }
     }
@@ -844,16 +1095,20 @@ Loaded cached credentials.
         let mgr = SessionManager::new();
         let received = Arc::new(StdMutex::new(String::new()));
         let received_clone = Arc::clone(&received);
-        let _ = mgr.execute_with_resume(AgentProvider::Dummy, "dummy prompt", move |chunk| {
-            received_clone.lock().unwrap().push_str(&chunk);
-        }).await;
+        let _ = mgr
+            .execute_with_resume(AgentProvider::Dummy, "dummy prompt", move |chunk| {
+                received_clone.lock().unwrap().push_str(&chunk);
+            })
+            .await;
         assert_eq!(received.lock().unwrap().as_str(), "dummy prompt");
     }
 
     #[tokio::test]
     async fn test_execute_with_resume_dummy_does_not_store_session() {
         let mgr = SessionManager::new();
-        let _ = mgr.execute_with_resume(AgentProvider::Dummy, "test", |_| {}).await;
+        let _ = mgr
+            .execute_with_resume(AgentProvider::Dummy, "test", |_| {})
+            .await;
         let sessions = mgr.session_ids.lock().await;
         assert!(sessions.is_empty());
     }
@@ -863,7 +1118,10 @@ Loaded cached credentials.
     #[tokio::test]
     async fn test_build_init_prompt_contains_memory_ready_instruction() {
         let prompt = AgentExecutor::build_init_prompt().await;
-        assert!(prompt.contains("MEMORY_READY"), "Prompt must contain MEMORY_READY");
+        assert!(
+            prompt.contains("MEMORY_READY"),
+            "Prompt must contain MEMORY_READY"
+        );
     }
 
     #[tokio::test]
